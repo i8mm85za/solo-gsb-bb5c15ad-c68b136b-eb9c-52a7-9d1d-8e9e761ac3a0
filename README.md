@@ -521,6 +521,60 @@ def verify(gzip_base64):
     assert hashlib.sha256(env["jsonl"].encode()).hexdigest() == m["payload_sha256"]  # 整体
 ```
 
+### 9. 注册表循环依赖诊断（只读）
+
+对**当前注册表**做循环依赖体检：把每个已登记的包版本视为有向图节点，
+若版本 `A@x` 声明的依赖范围能匹配注册表中的版本 `B@y`，则连一条
+`A@x -> B@y` 的边；随后用 Tarjan 算法求强连通分量（SCC），报告其中含循环的分量：
+
+- 大小 ≥ 2 的分量内必然存在循环；
+- 大小为 1 且带自环（**自依赖**：版本的范围命中了自身版本）的节点同样报告。
+
+```bash
+curl -s http://localhost:8000/api/v1/registry/cycles | jq
+```
+
+返回（示例）：
+
+```json
+{
+  "node_count": 22,
+  "edge_count": 47,
+  "cycle_count": 1,
+  "cycles": [
+    {
+      "size": 2,
+      "nodes": [
+        {"name": "cycle-a", "version": "1.0.0"},
+        {"name": "cycle-b", "version": "1.0.0"}
+      ],
+      "edges": [
+        {
+          "source": {"name": "cycle-a", "version": "1.0.0"},
+          "target": {"name": "cycle-b", "version": "1.0.0"},
+          "range": "^1.0.0"
+        },
+        {
+          "source": {"name": "cycle-b", "version": "1.0.0"},
+          "target": {"name": "cycle-a", "version": "1.0.0"},
+          "range": "^1.0.0"
+        }
+      ]
+    }
+  ]
+}
+```
+
+要点：
+
+- `node_count` / `edge_count` 是整幅依赖图的节点/边总数，`cycles` 只列出**含循环**的分量；
+- 每个分量给出涉及的包版本（`nodes`）与分量**内部**的依赖边（`edges`，含自环，
+  `range` 为源版本声明的范围原文）；指向分量之外的边不列入；
+- 排序稳定：分量按首节点的（包名, SemVer 版本）升序，分量内节点按（包名, 版本）升序，
+  边按源/目标的（包名, 版本）与范围升序；
+- **无循环时 `cycles` 返回空列表**（`cycle_count` 为 0），空注册表同样返回空列表；
+- 接口**只读**：不写入审计记录，也不改动注册表。
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -539,6 +593,7 @@ def verify(gzip_base64):
 | `POST` | `/api/v1/audits/verify-bundle` | 校验导出包：manifest、记录顺序、逐条摘要、整体摘要（不写库） |
 | `GET`  | `/api/v1/registry/packages` | 查看注册表全部包与版本 |
 | `PUT`  | `/api/v1/registry/packages/{name}` | 新增/覆盖一个包及其版本依赖 |
+| `GET`  | `/api/v1/registry/cycles` | 注册表循环依赖诊断：包版本为节点、范围匹配为边，报告强连通分量内的循环（含自依赖），只读不写库，无循环返回空列表 |
 
 ### 清单格式
 
@@ -593,6 +648,8 @@ pytest -q
 历史影响反查（resolution/冲突约束/来源链命中、层级与稳定排序、版本聚合、未知包空结果），
 时间桶汇总（day/week 分桶与周一 UTC 对齐、左闭右开边界、空桶补零、缺省边界派生、
 时间格式与区间非法返回 422、不被 /{id} 路由遮蔽），
+注册表循环依赖诊断（双包/多节点/自依赖循环、分量内部边过滤、稳定排序、
+空注册表与无环注册表返回空列表、只读不写库），
 以及导出包的确定性、重复/未知 ID 错误码与逐字节/顺序篡改识别。
 
 ## 项目结构
@@ -608,6 +665,7 @@ app/
   summary.py    # 审计结果的 UTC 时间桶汇总：day/week 分桶、左闭右开过滤、空桶补零（纯内存）
   models.py     # Pydantic 请求/响应模型
   impact.py     # 历史影响反查：resolution/sources/conflicts 扫描与层级计算
+  cycles.py     # 注册表循环依赖诊断：依赖图构建 + Tarjan 强连通分量（纯内存）
   bundle.py     # 可验证 JSONL 导出包的确定性构造与校验（sha256/gzip，纯内存）
 data/
   seed_registry.json   # 示例注册表

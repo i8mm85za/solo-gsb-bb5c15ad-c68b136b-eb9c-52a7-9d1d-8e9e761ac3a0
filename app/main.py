@@ -20,6 +20,7 @@ from pydantic import ValidationError
 from . import __version__
 from .bootstrap import initialize_database
 from .bundle import build_bundle, decode_bundle_base64, verify_bundle
+from .cycles import build_registry_cycles
 from .database import (
     DEFAULT_DB_PATH,
     cancel_job_item,
@@ -65,6 +66,7 @@ from .models import (
     ImpactResponse,
     ManifestIn,
     PackageIn,
+    RegistryCyclesResponse,
 )
 from .semver import Version, VersionError
 from .solver import Solver
@@ -138,6 +140,7 @@ def index() -> dict:
             "DELETE /api/v1/audit-jobs/{job_id}/items/{item_index}",
             "PUT /api/v1/registry/packages/{name}",
             "GET /api/v1/registry/packages",
+            "GET /api/v1/registry/cycles",
         ],
     }
 
@@ -797,3 +800,24 @@ def list_packages(request: Request) -> dict:
             for name, versions in sorted(registry.items())
         }
     }
+
+
+@app.get(
+    "/api/v1/registry/cycles",
+    response_model=RegistryCyclesResponse,
+    tags=["registry"],
+    summary="注册表循环依赖诊断：以包版本为节点、范围匹配为边，报告强连通分量内的循环（含自依赖）",
+)
+def get_registry_cycles(request: Request) -> RegistryCyclesResponse:
+    """只读诊断：不写入审计或注册表。
+
+    * 节点 = 注册表中每个已登记的包版本；
+    * 边 = 某版本声明的依赖范围匹配到注册表中满足该范围的目标版本
+      （范围命中自身版本时形成自环，即自依赖）；
+    * 大小 ≥ 2 的强连通分量，或带自环的单节点分量，视为循环；
+    * 组件、组件内节点与边均按（包名, SemVer 版本）稳定排序；
+      无循环时 ``cycles`` 返回空列表。
+    """
+    conn = get_conn(request)
+    registry = load_registry(conn)
+    return RegistryCyclesResponse(**build_registry_cycles(registry))

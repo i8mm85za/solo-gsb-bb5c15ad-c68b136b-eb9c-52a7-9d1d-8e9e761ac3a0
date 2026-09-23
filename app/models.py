@@ -416,6 +416,47 @@ class ImpactResponse(BaseModel):
     items: List[ImpactItemOut]
 
 
+# ---------- 注册表循环依赖诊断 ----------
+
+
+class RegistryCycleNodeOut(BaseModel):
+    """循环依赖图中的一个节点：一个已登记的包版本。"""
+
+    name: str
+    version: str
+
+
+class RegistryCycleEdgeOut(BaseModel):
+    """循环内部的一条依赖边：source 版本声明的依赖范围匹配到了 target 版本。"""
+
+    source: RegistryCycleNodeOut
+    target: RegistryCycleNodeOut
+    range: str = Field(..., description="source 版本对 target 包声明的 SemVer 范围原文")
+
+
+class RegistryCycleOut(BaseModel):
+    """一个含循环的强连通分量：涉及的包版本与分量内部的依赖边。"""
+
+    size: int = Field(..., description="分量内节点数；自依赖（自环）时 size=1")
+    nodes: List[RegistryCycleNodeOut] = Field(
+        ..., description="分量内的包版本，按（包名, SemVer 版本）升序"
+    )
+    edges: List[RegistryCycleEdgeOut] = Field(
+        ..., description="分量内部的依赖边（含自环），按源/目标的（包名, 版本）与范围升序"
+    )
+
+
+class RegistryCyclesResponse(BaseModel):
+    """GET /api/v1/registry/cycles：注册表循环依赖诊断结果。"""
+
+    node_count: int = Field(..., description="注册表中的包版本节点总数")
+    edge_count: int = Field(..., description="依赖范围匹配产生的有向边总数")
+    cycle_count: int = Field(..., description="含循环的强连通分量数量")
+    cycles: List[RegistryCycleOut] = Field(
+        ..., description="含循环的强连通分量列表，按首节点的（包名, 版本）升序；无循环时为空列表"
+    )
+
+
 # ---------- 可验证导出包 ----------
 
 class BundleExportIn(BaseModel):
