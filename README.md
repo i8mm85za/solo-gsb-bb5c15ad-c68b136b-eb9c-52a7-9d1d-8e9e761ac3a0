@@ -9,6 +9,8 @@
 - 所有审计结果持久化到 SQLite，支持按 ID 查询、列表过滤；
 - 支持**异步审计作业**：一次提交单条或批量清单立即拿到 `job_id`，后台按序逐项求解落库，
   可轮询作业状态/计数/逐项结果，可取消尚未开始的条目，服务重启后依据 SQLite 状态自动恢复；
+- 提供**只读注册表循环依赖诊断**：把每个已登记包版本按其依赖范围连线构图，
+  用强连通分量找出循环（含自依赖），返回涉及的包版本与依赖边，不写入审计或注册表；
 - 自带健康检查、OpenAPI 文档、示例注册表与一键 Docker Compose 启动。
 
 ## 一条命令启动
@@ -521,6 +523,93 @@ def verify(gzip_base64):
     assert hashlib.sha256(env["jsonl"].encode()).hexdigest() == m["payload_sha256"]  # 整体
 ```
 
+### 9. 注册表循环依赖诊断（只读）
+
+把注册表中**每个已登记的包版本**作为图节点：某版本声明的每条依赖
+（包名 + SemVer 范围）连向注册表中**所有满足该范围**的目标版本
+（目标包未登记、或没有满足范围的版本时不产生边）。
+随后在图上计算 Tarjan 强连通分量（SCC），找出其中的循环：
+
+- 规模 ≥ 2 的分量内部互相可达、必然成环，返回分量内的全部节点与**分量内**依赖边；
+- 单节点分量只有在存在**自环**（自依赖且自身版本满足其声明范围）时才作为循环报告；
+  自依赖范围不匹配自身版本时不算循环。
+
+该接口**只读**：不写入任何审计记录，也不修改注册表（重复调用结果不变）。
+
+```bash
+curl -s http://localhost:8000/api/v1/registry/cycles | jq
+```
+
+无循环时（示例种子注册表即为无环）返回空列表：
+
+```json
+{"total": 0, "components": []}
+```
+
+注入两个互相依赖的包后：
+
+```bash
+curl -s -X PUT http://localhost:8000/api/v1/registry/packages/cyc-a \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"cyc-a","versions":[{"version":"1.0.0","dependencies":{"cyc-b":"^2.0.0"}}]}'
+curl -s -X PUT http://localhost:8000/api/v1/registry/packages/cyc-b \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"cyc-b","versions":[{"version":"2.0.0","dependencies":{"cyc-a":"^1.0.0"}}]}'
+curl -s http://localhost:8000/api/v1/registry/cycles | jq
+```
+
+```json
+{
+  "total": 1,
+  "components": [
+    {
+      "nodes": [
+        {"name": "cyc-a", "version": "1.0.0"},
+        {"name": "cyc-b", "version": "2.0.0"}
+      ],
+      "edges": [
+        {
+          "source": {"name": "cyc-a", "version": "1.0.0"},
+          "target": {"name": "cyc-b", "version": "2.0.0"},
+          "version_range": "^2.0.0"
+        },
+        {
+          "source": {"name": "cyc-b", "version": "2.0.0"},
+          "target": {"name": "cyc-a", "version": "1.0.0"},
+          "version_range": "^1.0.0"
+        }
+      ]
+    }
+  ]
+}
+```
+
+自依赖（自环）以同样的形态报告，只是 `source` 与 `target` 相同，例如：
+
+```json
+{
+  "total": 1,
+  "components": [
+    {
+      "nodes": [{"name": "loopy", "version": "1.0.0"}],
+      "edges": [{
+        "source": {"name": "loopy", "version": "1.0.0"},
+        "target": {"name": "loopy", "version": "1.0.0"},
+        "version_range": "^1.0.0"
+      }]
+    }
+  ]
+}
+```
+
+要点：
+
+- **按范围展开边**：一条依赖范围匹配多个目标版本时，每个满足范围的版本各产生一条边；
+  范围匹配完全沿用服务的 SemVer 解析（caret/tilde/X 范围/hyphen/OR 与预发布可见性规则）；
+- **稳定排序**：分量按其节点序列排序；分量内节点与边均按包名、SemVer 版本
+  （数值序，如 `1.2.0` < `1.10.0`）升序，重复调用输出字节一致；
+- 仅 `GET`（其他方法返回 `405`），始终 `200`，无任何参数；空注册表也返回空列表。
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -537,6 +626,7 @@ def verify(gzip_base64):
 | `GET`  | `/api/v1/audits/impact/{package_name}` | 历史影响反查：扫描 resolution/sources/conflicts，找直接或传递依赖该包/版本的审计（可选 `version` / `status` / `limit`），未知包返回空结果而非 404 |
 | `POST` | `/api/v1/audits/export-bundle` | 把已有审计结果打包为确定性、可验证的 JSONL 导出包（只读，不写库） |
 | `POST` | `/api/v1/audits/verify-bundle` | 校验导出包：manifest、记录顺序、逐条摘要、整体摘要（不写库） |
+| `GET`  | `/api/v1/registry/cycles` | 只读循环依赖诊断：包版本按依赖范围连线构图，返回含环强连通分量（含自依赖）的节点与边；无循环返回空列表 |
 | `GET`  | `/api/v1/registry/packages` | 查看注册表全部包与版本 |
 | `PUT`  | `/api/v1/registry/packages/{name}` | 新增/覆盖一个包及其版本依赖 |
 
@@ -593,6 +683,8 @@ pytest -q
 历史影响反查（resolution/冲突约束/来源链命中、层级与稳定排序、版本聚合、未知包空结果），
 时间桶汇总（day/week 分桶与周一 UTC 对齐、左闭右开边界、空桶补零、缺省边界派生、
 时间格式与区间非法返回 422、不被 /{id} 路由遮蔽），
+注册表循环依赖诊断（空注册表/有向无环图返回空列表、自依赖自环按范围是否满足报告、
+多包环的节点与分量内边、范围一对多展开、SemVer 数值序稳定排序、只读不产生审计/注册表写入），
 以及导出包的确定性、重复/未知 ID 错误码与逐字节/顺序篡改识别。
 
 ## 项目结构
@@ -608,6 +700,7 @@ app/
   summary.py    # 审计结果的 UTC 时间桶汇总：day/week 分桶、左闭右开过滤、空桶补零（纯内存）
   models.py     # Pydantic 请求/响应模型
   impact.py     # 历史影响反查：resolution/sources/conflicts 扫描与层级计算
+  cycles.py     # 只读注册表循环依赖诊断：按依赖范围构图 + Tarjan 强连通分量（纯内存）
   bundle.py     # 可验证 JSONL 导出包的确定性构造与校验（sha256/gzip，纯内存）
 data/
   seed_registry.json   # 示例注册表

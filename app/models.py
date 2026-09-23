@@ -103,6 +103,44 @@ class PackageIn(BaseModel):
         return value
 
 
+# ---------- 注册表循环依赖诊断 ----------
+
+
+class RegistryVersionRef(BaseModel):
+    """循环诊断图中的一个包版本节点。"""
+
+    name: str = Field(..., description="包名")
+    version: str = Field(..., description="已登记的具体版本（SemVer）")
+
+
+class RegistryCycleEdgeOut(BaseModel):
+    """参与循环的一条依赖边：源版本声明范围、目标版本满足该范围。"""
+
+    source: RegistryVersionRef = Field(..., description="提出依赖的包版本")
+    target: RegistryVersionRef = Field(..., description="被依赖且满足范围的包版本（可与源相同=自依赖）")
+    version_range: str = Field(..., description="源版本声明的 SemVer 范围原文")
+
+
+class RegistryCycleComponentOut(BaseModel):
+    """一个含环强连通分量：分量内的全部包版本节点与分量内依赖边。"""
+
+    nodes: List[RegistryVersionRef] = Field(
+        ..., description="分量内全部包版本，按 (包名, SemVer 版本) 升序"
+    )
+    edges: List[RegistryCycleEdgeOut] = Field(
+        ..., description="分量内全部依赖边（含自依赖自环），按源/目标名称与版本升序"
+    )
+
+
+class RegistryCyclesResponse(BaseModel):
+    """GET /api/v1/registry/cycles：注册表循环依赖诊断结果（只读）。"""
+
+    total: int = Field(..., description="含环强连通分量数量（自依赖自环计为一个分量）；无循环时为 0")
+    components: List[RegistryCycleComponentOut] = Field(
+        ..., description="按分量首个（包名, 版本）排序；无循环时为空列表"
+    )
+
+
 class HealthResponse(BaseModel):
     status: Literal["ok", "degraded"]
     database: Literal["ok", "error"]

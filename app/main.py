@@ -20,6 +20,7 @@ from pydantic import ValidationError
 from . import __version__
 from .bootstrap import initialize_database
 from .bundle import build_bundle, decode_bundle_base64, verify_bundle
+from .cycles import build_registry_cycles
 from .database import (
     DEFAULT_DB_PATH,
     cancel_job_item,
@@ -65,6 +66,7 @@ from .models import (
     ImpactResponse,
     ManifestIn,
     PackageIn,
+    RegistryCyclesResponse,
 )
 from .semver import Version, VersionError
 from .solver import Solver
@@ -136,6 +138,7 @@ def index() -> dict:
             "POST /api/v1/audit-jobs",
             "GET /api/v1/audit-jobs/{job_id}",
             "DELETE /api/v1/audit-jobs/{job_id}/items/{item_index}",
+            "GET /api/v1/registry/cycles",
             "PUT /api/v1/registry/packages/{name}",
             "GET /api/v1/registry/packages",
         ],
@@ -768,6 +771,61 @@ def verify_bundle_endpoint(payload: BundleVerifyIn) -> BundleVerifyResponse:
         status_code=422,
         detail="必须提供 gzip_base64，或同时提供 jsonl 与 manifest",
     )
+
+
+@app.get(
+    "/api/v1/registry/cycles",
+    response_model=RegistryCyclesResponse,
+    tags=["registry"],
+    summary="只读诊断：按依赖范围把包版本连成图，找出强连通分量中的循环（含自依赖）",
+    responses={
+        200: {
+            "description": "诊断结果；注册表无循环（空注册表也不报错）时 components 为空列表",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "total": 1,
+                        "components": [
+                            {
+                                "nodes": [
+                                    {"name": "alpha", "version": "1.0.0"},
+                                    {"name": "beta", "version": "2.0.0"},
+                                ],
+                                "edges": [
+                                    {
+                                        "source": {"name": "alpha", "version": "1.0.0"},
+                                        "target": {"name": "beta", "version": "2.0.0"},
+                                        "version_range": "^2.0.0",
+                                    },
+                                    {
+                                        "source": {"name": "beta", "version": "2.0.0"},
+                                        "target": {"name": "alpha", "version": "1.0.0"},
+                                        "version_range": "^1.0.0",
+                                    },
+                                ],
+                            }
+                        ],
+                    }
+                }
+            },
+        }
+    },
+)
+def get_registry_cycles(request: Request) -> RegistryCyclesResponse:
+    """在当前注册表快照上做循环依赖诊断，**只读**：不写入审计记录，也不修改注册表。
+
+    * 每个已登记的包版本是一个图节点；某版本声明的每条依赖（包名 + SemVer 范围）
+      连向注册表中**所有满足该范围**的目标版本（目标包未登记或无满足版本则无边）；
+    * 使用 Tarjan 强连通分量（SCC）识别循环：规模 >= 2 的分量整体成环，
+      单节点分量仅在存在**自环**（自依赖且自身版本满足声明范围）时报告；
+    * 返回每个含环分量的全部节点与分量内依赖边；`version_range` 为源版本声明原文，
+      同一条依赖范围匹配多个目标版本时按目标版本各产生一条边；
+    * 稳定排序：分量按其节点序列排序，分量内节点与边均按名称、SemVer 版本升序；
+    * 注册表中不存在任何循环时返回 `{"total": 0, "components": []}`。
+    """
+    conn = get_conn(request)
+    registry = load_registry(conn)
+    return RegistryCyclesResponse(**build_registry_cycles(registry))
 
 
 @app.put("/api/v1/registry/packages/{name}", response_model=dict, tags=["registry"])
